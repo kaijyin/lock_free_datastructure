@@ -15,6 +15,9 @@
  *   store(release) 配对 load(acquire)，确保数据可见性
  *   不使用 seq_cst，减少 MFENCE 指令开销
  *
+ * 实际就是因为满了也没关系，不阻塞直接返回。所以每次都就算读过去的容量，大不了失败就是，不会对正确性产生影响。
+ * 通过引入cached_read和cached_write，只在满或者空时才用acquire
+ * load更新它们，减少了不必要的acquire load，提升性能。
  * 约束:
  *   - Capacity 必须是 2 的幂
  *   - 严格 1 个生产者线程 + 1 个消费者线程
