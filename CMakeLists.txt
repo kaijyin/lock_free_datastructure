@@ -43,6 +43,15 @@ target_link_libraries(correctness_test
     pthread
 )
 
+# ---- 内存池/对象池测试 ----
+add_executable(pool_test tests/pool_test.cpp)
+target_link_libraries(pool_test
+    PRIVATE
+    GTest::GTest
+    GTest::Main
+    pthread
+)
+
 # ---- 性能测试 ----
 add_executable(performance_test tests/performance_test.cpp)
 target_link_libraries(performance_test
@@ -52,4 +61,44 @@ target_link_libraries(performance_test
 # 性能测试强制 Release 优化（即使 CMAKE_BUILD_TYPE=Debug 也保留高优化）
 target_compile_options(performance_test PRIVATE
     $<$<CONFIG:Debug>:-O2>
+)
+
+# ---- 内存池/对象池性能测试 ----
+add_executable(pool_performance_test tests/pool_performance_test.cpp)
+target_link_libraries(pool_performance_test
+    PRIVATE
+    pthread
+)
+target_compile_options(pool_performance_test PRIVATE
+    -O3
+)
+
+# ---- SPSC align(64) 性能测试 ----
+add_executable(spsc_align_performance_test tests/spsc_align_performance_test.cpp)
+target_link_libraries(spsc_align_performance_test
+    PRIVATE
+    pthread
+)
+target_compile_options(spsc_align_performance_test PRIVATE
+    -O3
+)
+
+# ---- SPSC vs MPMC 吞吐性能测试 ----
+add_executable(mpmc_spsc_performance_test tests/mpmc_spsc_performance_test.cpp)
+target_link_libraries(mpmc_spsc_performance_test
+    PRIVATE
+    pthread
+)
+target_compile_options(mpmc_spsc_performance_test PRIVATE
+    -O3
+)
+
+# ---- 线程绑核测试 ----
+add_executable(thread_affinity tests/bind_core_test.cpp)
+target_link_libraries(thread_affinity
+    PRIVATE
+    pthread
+)
+target_compile_options(thread_affinity PRIVATE
+    -O3
 )
