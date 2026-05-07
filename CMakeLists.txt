@@ -102,3 +102,13 @@ target_link_libraries(thread_affinity
 target_compile_options(thread_affinity PRIVATE
     -O3
 )
+
+# ---- Cache 共享模式对比测试 ----
+add_executable(cache_sharing_test tests/cache_sharing_test.cpp)
+target_link_libraries(cache_sharing_test
+    PRIVATE
+    pthread
+)
+target_compile_options(cache_sharing_test PRIVATE
+    -O2
+)
