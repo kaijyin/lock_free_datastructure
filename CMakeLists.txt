@@ -112,3 +112,14 @@ target_link_libraries(cache_sharing_test
 target_compile_options(cache_sharing_test PRIVATE
     -O2
 )
+
+# ---- SPSC-Pairs vs MPMC-Single 吞吐对比 ----
+add_executable(spsc_pairs_vs_mpmc_test tests/spsc_pairs_vs_mpmc_test.cpp)
+target_include_directories(spsc_pairs_vs_mpmc_test PRIVATE include)
+target_link_libraries(spsc_pairs_vs_mpmc_test
+    PRIVATE
+    pthread
+)
+target_compile_options(spsc_pairs_vs_mpmc_test PRIVATE
+    -O3
+)
