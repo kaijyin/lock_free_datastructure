@@ -34,12 +34,21 @@ namespace {
 
 constexpr int kThreadCount = 4;
 constexpr std::uint64_t kIncrementsPerThread = 500'000;
+constexpr double kDoubleIncrement = 0.5;
 constexpr int kPayloadValue = 42;
 
 struct CounterSummary {
   std::string_view name;
   std::uint64_t expected = 0;
   std::uint64_t observed = 0;
+  double ns_per_fetch_add = 0.0;
+};
+
+struct DoubleCounterSummary {
+  std::string_view name;
+  double expected = 0.0;
+  double observed = 0.0;
+  bool is_lock_free = false;
   double ns_per_fetch_add = 0.0;
 };
 
@@ -92,6 +101,42 @@ CounterSummary RunCounter(std::string_view name) {
   };
 }
 
+template <std::memory_order Order>
+DoubleCounterSummary RunDoubleCounter(std::string_view name) {
+  std::atomic<double> counter{0.0};
+  const bool is_lock_free = counter.is_lock_free();
+  std::vector<std::thread> threads;
+  threads.reserve(kThreadCount);
+
+  const auto start = std::chrono::steady_clock::now();
+  for (int thread_index = 0; thread_index < kThreadCount; ++thread_index) {
+    threads.emplace_back([&] {
+      for (std::uint64_t i = 0; i < kIncrementsPerThread; ++i) {
+        counter.fetch_add(kDoubleIncrement, Order);
+      }
+    });
+  }
+
+  for (auto &thread : threads) {
+    thread.join();
+  }
+  const auto stop = std::chrono::steady_clock::now();
+
+  const auto operation_count = kIncrementsPerThread * kThreadCount;
+  const double expected =
+      static_cast<double>(operation_count) * kDoubleIncrement;
+  const auto elapsed =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start);
+  return DoubleCounterSummary{
+      name,
+      expected,
+      counter.load(std::memory_order_relaxed),
+      is_lock_free,
+      static_cast<double>(elapsed.count()) /
+          static_cast<double>(operation_count),
+  };
+}
+
 template <std::memory_order AddOrder, std::memory_order LoadOrder>
 PublishSummary RunPublish(std::string_view name, bool has_happens_before) {
   Message message;
@@ -121,13 +166,21 @@ void PrintCounterSummary(const CounterSummary &summary) {
             << summary.ns_per_fetch_add << "\n";
 }
 
+void PrintDoubleCounterSummary(const DoubleCounterSummary &summary) {
+  std::cout << std::left << std::setw(12) << summary.name << " expected "
+            << std::fixed << std::setprecision(1) << summary.expected
+            << ", observed " << summary.observed << ", lock_free "
+            << (summary.is_lock_free ? "yes" : "no") << ", ns/fetch_add "
+            << std::setprecision(2) << summary.ns_per_fetch_add << "\n";
+}
+
 void PrintPublishSummary(const PublishSummary &summary) {
   std::cout << std::left << std::setw(24) << summary.name << " observed "
             << summary.observed << ", "
             << (summary.has_happens_before ? "correct" : "wrong") << "\n";
 }
 
-}  // namespace
+} // namespace
 
 int main() {
   const std::vector<CounterSummary> counters = {
@@ -143,6 +196,21 @@ int main() {
     PrintCounterSummary(summary);
     Check(summary.observed == summary.expected,
           "fetch_add must not lose increments");
+  }
+
+  const std::vector<DoubleCounterSummary> double_counters = {
+      RunDoubleCounter<std::memory_order_relaxed>("relaxed"),
+      RunDoubleCounter<std::memory_order_acquire>("acquire"),
+      RunDoubleCounter<std::memory_order_release>("release"),
+      RunDoubleCounter<std::memory_order_acq_rel>("acq_rel"),
+      RunDoubleCounter<std::memory_order_seq_cst>("seq_cst"),
+  };
+
+  std::cout << "\natomic<double> fetch_add as a counter\n";
+  for (const DoubleCounterSummary &summary : double_counters) {
+    PrintDoubleCounterSummary(summary);
+    Check(summary.observed == summary.expected,
+          "atomic<double> fetch_add must not lose increments");
   }
 
   const std::vector<PublishSummary> publishes = {
@@ -167,12 +235,5 @@ int main() {
           "x86 often prints the expected value even for wrong variants");
   }
 
-  std::cout << "\nNotes:\n";
-  std::cout
-      << "1. Counter results should all be correct: memory_order does not "
-         "change fetch_add atomicity.\n";
-  std::cout
-      << "2. Publish variants marked wrong have no C++ happens-before for "
-         "payload; use TSan to see the data race.\n";
   return 0;
 }

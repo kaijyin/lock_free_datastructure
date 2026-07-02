@@ -129,6 +129,7 @@ set(ATOMIC_EXAMPLES
     atomic_memory_order_store_buffering
     atomic_pc_publish_compare
     atomic_fetch_add_memory_order
+    atomic_relaxed_reorder
 )
 
 foreach(example ${ATOMIC_EXAMPLES})

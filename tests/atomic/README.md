@@ -9,6 +9,8 @@
   memory order 的 Store Buffering 结果。
 - `atomic_fetch_add_memory_order.cpp`：对比 `fetch_add` 作为纯计数器和作为
   发布信号时，不同 memory order 的含义。
+- `atomic_relaxed_reorder.cpp`：观察 GCC 对 atomic 访存、普通内存访存和
+  无关计算的编译期重排。
 
 ## Producer/Consumer 发布普通数据
 
@@ -569,6 +571,165 @@ store 还在本核心 store buffer 中，或者尚未完成让其他核心可见
 语义。它比普通 `mov` 更强，能够阻止不含 `seq_cst store` 的 `mov + mov`
 组合允许的 Store Buffering 结果。
 
+## `atomic_relaxed_reorder.cpp`
+
+这个文件不是做并发运行结果统计，而是专门观察编译器生成的汇编：同一个函数
+里混合 atomic load/store、普通全局变量或指针参数上的 load/store、以及与访存
+无关的整数计算时，GCC 会怎样调度指令。
+
+运行和查看汇编：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target atomic_relaxed_reorder
+./build/atomic_relaxed_reorder
+
+g++ -std=c++20 -O3 -DNDEBUG -march=native -S -masm=intel \
+  tests/atomic/atomic_relaxed_reorder.cpp \
+  -o build/atomic_relaxed_reorder.s
+
+grep -A60 'PlainReadModifyWritesAroundSeqCstStore' \
+  build/atomic_relaxed_reorder.s
+```
+
+如果本机缺少 GTest，顶层 CMake 可能在配置阶段失败；这个示例本身不依赖
+GTest，可以直接用上面的 `g++` 命令单独编译。
+
+### 主要实验形状
+
+第一类：只看 atomic 访存之间是否被重排。
+
+```cpp
+g_store_a.store(1, std::memory_order_relaxed);
+g_store_b.store(2, std::memory_order_relaxed);
+g_store_c.store(3, std::memory_order_relaxed);
+
+const int a = g_load_a.load(std::memory_order_relaxed);
+const int b = g_load_b.load(std::memory_order_relaxed);
+const int c = g_load_c.load(std::memory_order_relaxed);
+```
+
+文件中还包含 load 后 store、store/load 交错、同一个 atomic 重复访问、通过
+指针参数访问 atomic 等版本。
+
+第二类：在 atomic 访存之间加入只在寄存器里完成的整数计算。
+
+```cpp
+g_store_a.store(1, std::memory_order_relaxed);
+const int first = MixIntegers(x, y);
+g_store_b.store(2, std::memory_order_relaxed);
+const int second = MixIntegers(static_cast<std::uint32_t>(first), x + 17);
+g_store_c.store(3, std::memory_order_relaxed);
+```
+
+第三类：在 release/acquire/seq_cst 周围加入普通内存访问。
+
+```cpp
+const int before_a = g_plain_a;
+const int before_b = g_plain_b;
+const int first = MixIntegers(before_a + x, before_b + y);
+g_plain_c = first;
+g_plain_d = before_a + before_b;
+
+g_store_a.store(1, std::memory_order_release);
+
+const int after_e = g_plain_e;
+const int after_f = g_plain_f;
+const int second = MixIntegers(after_e + y, after_f + x);
+g_plain_g = second;
+g_plain_h = after_e + after_f;
+```
+
+这个形状也有 acquire load 和 seq_cst store/load 版本。
+
+### 当前 GCC/x86_64 观察结论
+
+当前环境：
+
+```text
+Compiler: g++ 12.2.0
+Architecture: x86_64
+Flags: -O3 -DNDEBUG -march=native
+```
+
+观察结果：
+
+- `memory_order_relaxed` 的 atomic load/store 编译成普通 `mov`。
+- `memory_order_release` store 和 `memory_order_acquire` load 也编译成普通
+  `mov`。
+- `memory_order_seq_cst` store 编译成 `xchg`。
+- `memory_order_seq_cst` load 仍编译成普通 `mov`。
+- 没观察到 GCC 把 atomic 访存和其他 atomic 访存互相重排。
+- 同形普通全局变量读改写测试中，没观察到普通 `g_plain_*` 访存跨过
+  relaxed atomic store。
+- 没观察到普通全局变量或指针参数上的 load/store 跨过 release/acquire。
+- 没观察到普通全局变量 load/store 跨过 seq_cst store/load。
+- 与访存无关、只在寄存器里完成的计算会被大幅调度。GCC 会把它拆开，
+  安排到 atomic 操作前后。
+- 普通 `g_plain_*` 访问在 release/acquire/seq_cst 边界的同一侧内部仍可能
+  重排，例如同在 release 前的两个普通 store 可以调换顺序。
+- `ComplexRelaxedPlainComputeMix()` 这类复杂 relaxed 混合测试中，普通
+  `g_plain_*` 写入和计算也会被调度，但没有观察到 atomic relaxed 访存之间
+  互相重排。
+
+例如 `ComputeBetweenStoresRelaxed()` 的源码顺序是：
+
+```text
+store_a(relaxed)
+计算 first
+store_b(relaxed)
+计算 second
+store_c(relaxed)
+```
+
+但汇编中 GCC 会把若干普通计算移开，形成类似：
+
+```asm
+imul edx, edi, 1664525
+mov  DWORD PTR g_store_a[rip], 1
+mov  DWORD PTR g_store_b[rip], 2
+mov  DWORD PTR g_store_c[rip], 3
+imul esi, esi, 1013904223
+...
+```
+
+这里不是 atomic store 之间被重排；`store_a -> store_b -> store_c` 的顺序仍然
+保持。被移动的是与访存无关的普通整数计算。
+
+再看普通内存访问和 release：
+
+```cpp
+g_plain_a = 101;
+g_plain_b = 202;
+g_store_a.store(1, std::memory_order_release);
+g_plain_c = 303;
+```
+
+当前 GCC 输出仍保持普通 store 不跨过 release：
+
+```asm
+mov DWORD PTR g_plain_a[rip], 101
+mov DWORD PTR g_plain_b[rip], 202
+mov DWORD PTR g_store_a[rip], 1
+mov DWORD PTR g_plain_c[rip], 303
+```
+
+seq_cst store 版本里，atomic store 会变成 `xchg`：
+
+```asm
+mov  esi, 1
+xchg esi, DWORD PTR g_store_a[rip]
+```
+
+### 注意边界
+
+这个文件记录的是当前 GCC、当前优化参数、当前 x86_64 目标下的实现现象，不是
+C++ 标准给出的可移植承诺。C++ 内存模型规定的是语义保证；不同编译器、版本、
+优化参数或目标架构都可能生成不同代码。
+
+另外，普通 store 如果后续没有可观察读取，可能被 GCC 删除或折叠成常量。
+`ReadManyPlainGlobals()` 的作用就是让“多个普通全局 store”测试不会退化成死写。
+
 ## `atomic_fetch_add_memory_order.cpp`
 
 这个文件演示 `fetch_add` 的两个常见用法。
@@ -621,6 +782,13 @@ acquire      expected 2000000, observed 2000000, ns/fetch_add 9.28
 release      expected 2000000, observed 2000000, ns/fetch_add 13.40
 acq_rel      expected 2000000, observed 2000000, ns/fetch_add 15.14
 seq_cst      expected 2000000, observed 2000000, ns/fetch_add 14.44
+
+atomic<double> fetch_add as a counter
+relaxed      expected 1000000.0, observed 1000000.0, lock_free yes, ns/fetch_add 16.06
+acquire      expected 1000000.0, observed 1000000.0, lock_free yes, ns/fetch_add 40.20
+release      expected 1000000.0, observed 1000000.0, lock_free yes, ns/fetch_add 22.25
+acq_rel      expected 1000000.0, observed 1000000.0, lock_free yes, ns/fetch_add 14.64
+seq_cst      expected 1000000.0, observed 1000000.0, lock_free yes, ns/fetch_add 44.36
 
 fetch_add as a publish signal
 relaxed/relaxed          observed 42, wrong
@@ -697,6 +865,23 @@ ret
 原因是 read-modify-write 操作必须原子地完成“读旧值 + 写新值”。在 x86 上，
 跨核心共享 atomic 变量的 RMW 通常需要 `lock` 前缀来保证这个操作不可被其他
 核心打断。
+
+`atomic<double>::fetch_add` 也是 RMW，但 x86 没有“一条指令完成 double 加法并
+原子写回”的通用指令。当前 GCC 12.2 + x86_64 下，`atomic<double>` 在本机
+`is_lock_free()` 为 true，但 `fetch_add` 核心实现是 compare-exchange 循环：
+
+```asm
+mov          rax, QWORD PTR [rdx]
+vmovq        xmm0, rax
+vaddsd       xmm0, xmm0, xmm1
+vmovq        r8, xmm0
+lock cmpxchg QWORD PTR [rdx], r8
+jne          retry
+```
+
+如果 `cmpxchg` 失败，说明另一个线程已经改了这个 double 值；循环会用新读到的
+值重新做浮点加法再尝试写回。因此 `atomic<double>::fetch_add` 也不会丢加法，
+但在竞争下通常比整数 `fetch_add` 更贵。
 
 所以在 x86 上，`fetch_add(relaxed)` 和 `fetch_add(seq_cst)` 的核心汇编可能
 看起来一样，性能也可能接近。但它们在 C++ 语义上不同：
