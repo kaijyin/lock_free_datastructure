@@ -126,9 +126,9 @@ target_compile_options(spsc_pairs_vs_mpmc_test PRIVATE
 
 # ---- atomic 使用示例 ----
 set(ATOMIC_EXAMPLES
-    atomic_spsc_ring_index_too_early
     atomic_memory_order_store_buffering
     atomic_pc_publish_compare
+    atomic_fetch_add_memory_order
 )
 
 foreach(example ${ATOMIC_EXAMPLES})

@@ -7,6 +7,8 @@
   `release/acquire` 发布。
 - `atomic_memory_order_store_buffering.cpp`：对比相同代码形状下不同
   memory order 的 Store Buffering 结果。
+- `atomic_fetch_add_memory_order.cpp`：对比 `fetch_add` 作为纯计数器和作为
+  发布信号时，不同 memory order 的含义。
 
 ## Producer/Consumer 发布普通数据
 
@@ -275,19 +277,27 @@ Store Buffering: same code, different memory_order
 
 relaxed
 iterations:      1000000
-both zero count: 16599
+both zero count: 10948
 
 release/relaxed
 iterations:      1000000
-both zero count: 10544
+both zero count: 4891
 
 relaxed/acquire
 iterations:      1000000
-both zero count: 16725
+both zero count: 6328
+
+relaxed/seq_cst
+iterations:      1000000
+both zero count: 9602
+
+seq_cst/relaxed
+iterations:      1000000
+both zero count: 0
 
 release/acquire
 iterations:      1000000
-both zero count: 17542
+both zero count: 18425
 
 seq_cst
 iterations:      1000000
@@ -299,8 +309,12 @@ both zero count: 0
 - `relaxed` 可能出现 both-zero。
 - `release/relaxed` 可能出现 both-zero。
 - `relaxed/acquire` 可能出现 both-zero。
+- `relaxed/seq_cst` 也可能出现 both-zero。它只有 load 是 seq_cst，两个 store
+  不是 seq_cst。
+- `seq_cst/relaxed` 在当前 x86_64 + GCC 下不会出现 both-zero，因为
+  `seq_cst store` 编译成了更强的 `xchg`。
 - `release/acquire` 可能出现 both-zero。
-- `seq_cst` 禁止 both-zero。
+- `seq_cst/seq_cst` 禁止 both-zero。
 
 ### Store Buffering 的精简汇编
 
@@ -330,6 +344,16 @@ extern "C" __attribute__((noinline)) void relaxed_acquire_core() {
   r1 = y.load(std::memory_order_acquire);
 }
 
+extern "C" __attribute__((noinline)) void relaxed_seq_cst_core() {
+  x.store(1, std::memory_order_relaxed);
+  r1 = y.load(std::memory_order_seq_cst);
+}
+
+extern "C" __attribute__((noinline)) void seq_cst_relaxed_core() {
+  x.store(1, std::memory_order_seq_cst);
+  r1 = y.load(std::memory_order_relaxed);
+}
+
 extern "C" __attribute__((noinline)) void release_acquire_core() {
   x.store(1, std::memory_order_release);
   r1 = y.load(std::memory_order_acquire);
@@ -344,7 +368,24 @@ CPP
 sed -n '1,180p' /tmp/atomic_order_core.s
 ```
 
-前四种在当前 x86_64 + GCC 下的核心汇编相同：
+对普通 lock-free `atomic<int>` 的 load/store，当前 x86_64 + GCC 下可以粗略
+总结成：
+
+```text
+load(relaxed)   -> mov
+load(acquire)   -> mov
+load(seq_cst)   -> mov
+
+store(relaxed)  -> mov
+store(release)  -> mov
+store(seq_cst)  -> xchg
+```
+
+也就是说，只有 `seq_cst store` 在这里明显变成了更强的指令。`fetch_add`、
+`compare_exchange` 这类 read-modify-write 不属于这个表，它们通常会生成
+`lock add`、`lock xadd`、`lock cmpxchg` 之类的 RMW 指令。
+
+不含 `seq_cst store` 的前五种在当前 x86_64 + GCC 下核心汇编相同：
 
 ```asm
 mov DWORD PTR x[rip], 1
@@ -353,7 +394,22 @@ mov DWORD PTR r1[rip], eax
 ret
 ```
 
-`seq_cst` 不同：
+其中 `relaxed/seq_cst` 的实现是：
+
+```asm
+mov DWORD PTR x[rip], 1    ; x.store(1, relaxed)
+mov eax, DWORD PTR y[rip]  ; y.load(seq_cst)
+mov DWORD PTR r1[rip], eax
+ret
+```
+
+这里 `seq_cst load` 仍然只是普通 `mov`。原因是 x86_64 的普通 load 已经足够
+满足 acquire/seq_cst load 的硬件约束；这个 load 会参与 C++ 的 seq_cst 全局
+顺序，但前面的 `relaxed store` 不参与 seq_cst 全局顺序，也不会因为后面有
+seq_cst load 就被强制从 store buffer 刷到其他核心可见。因此
+`relaxed/seq_cst` 仍然可能出现 both-zero。
+
+`seq_cst/relaxed` 和 `seq_cst/seq_cst` 不同：
 
 ```asm
 mov  eax, 1
@@ -362,6 +418,21 @@ mov  eax, DWORD PTR y[rip]
 mov  DWORD PTR r1[rip], eax
 ret
 ```
+
+其中 `seq_cst/relaxed` 的实现是：
+
+```asm
+mov  eax, 1
+xchg eax, DWORD PTR x[rip] ; x.store(1, seq_cst)
+mov  eax, DWORD PTR y[rip] ; y.load(relaxed)
+mov  DWORD PTR r1[rip], eax
+ret
+```
+
+这里变强的是 `seq_cst store`，不是 relaxed load。GCC 在 x86_64 上通常用
+`xchg` 实现 seq_cst store；`xchg` 对内存操作有隐式锁语义，会让这个 store
+在继续执行后续 load 前完成更强的全局可见性约束。于是当前机器上
+`seq_cst/relaxed` 实测 both-zero 为 0。
 
 ### 为什么 release/acquire 仍然会出现 both-zero
 
@@ -385,8 +456,8 @@ r2 == 0
 那么两个 acquire load 都读到了初始值 `0`，没有读到对方 release store 写入的
 `1`。因此没有建立 synchronizes-with，也就没有跨线程 happens-before。
 
-在 x86 上，前四种核心汇编都是普通 `mov`。普通 store 可能先进入本核心的
-store buffer，后续 load 读取的是另一个地址：
+在 x86 上，不含 `seq_cst store` 的五种核心汇编都是普通 `mov`。普通 store
+可能先进入本核心的 store buffer，后续 load 读取的是另一个地址：
 
 ```text
 core 0: x=1 暂存在 core 0 的 store buffer
@@ -431,6 +502,19 @@ L1 cache / cache coherence
 队列，然后后续指令继续执行。这个 store 对本核心来说已经排入队列，但对其他
 核心可能还没有全局可见。
 
+store buffer 中的 store 没有一个固定的保存时间。CPU 会在满足下面条件后尽快
+把它提交到 L1/cache coherence：
+
+```text
+目标 cache line 已在本核，或者本核已经拿到独占/可修改权限；
+更早的 store 已经按架构要求处理完成；
+L1/cache pipeline 和一致性事务资源可用。
+```
+
+如果目标 cache line 已经在本核的 Modified/Exclusive 状态，提交可能很快。
+如果这条 cache line 正在别的核心手里，CPU 需要先通过缓存一致性协议让其他
+核心失效或交出所有权，这个 store 在其他核心看来就会晚一些才可见。
+
 因此 Store Buffering 场景里会出现：
 
 ```text
@@ -466,7 +550,7 @@ store 还在本核心 store buffer 中，或者尚未完成让其他核心可见
 其他核心暂时看不到这个 store。
 ```
 
-### 为什么 seq_cst 禁止 both-zero
+### 为什么 seq_cst/seq_cst 禁止 both-zero
 
 `seq_cst` 要求所有 `seq_cst` 原子操作能排成一个所有线程都同意的全局顺序。
 
@@ -482,5 +566,147 @@ store 还在本核心 store buffer 中，或者尚未完成让其他核心可见
 `seq_cst` 版本出现 both-zero。
 
 在当前 x86_64 + GCC 下，`seq_cst store` 也被编译成更强的 `xchg`，带隐式锁
-语义。它比普通 `mov` 更强，能够阻止前四种 `mov + mov` 允许的 Store
-Buffering 结果。
+语义。它比普通 `mov` 更强，能够阻止不含 `seq_cst store` 的 `mov + mov`
+组合允许的 Store Buffering 结果。
+
+## `atomic_fetch_add_memory_order.cpp`
+
+这个文件演示 `fetch_add` 的两个常见用法。
+
+第一种：只把 `fetch_add` 当作计数器。
+
+```cpp
+counter.fetch_add(1, order);
+```
+
+这个场景下，`memory_order` 不影响计数器本身的原子性。多个线程同时加同一个
+atomic 变量，不管使用 `relaxed`、`acquire`、`release`、`acq_rel` 还是
+`seq_cst`，最终计数都不会丢。
+
+第二种：把 `fetch_add` 当作发布信号。
+
+```cpp
+message.payload = 42;
+message.published.fetch_add(1, add_order);
+
+while (message.published.load(load_order) == 0) {
+  std::this_thread::yield();
+}
+observed = message.payload;
+```
+
+这时 `memory_order` 会影响普通数据 `payload` 是否被正确发布：
+
+- `relaxed/relaxed`：错误。只保证 `published` 的加法原子，不发布 `payload`。
+- `release/relaxed`：错误。producer 做了 release，但 consumer 没有 acquire。
+- `relaxed/acquire`：错误。consumer 做了 acquire，但没有读到 release 写入。
+- `release/acquire`：正确。consumer 的 acquire load 读到 producer 的
+  release `fetch_add` 结果时，建立 synchronizes-with。
+- `acq_rel/acquire`：正确。`fetch_add(acq_rel)` 包含 release 语义。
+- `seq_cst/seq_cst`：正确，并且所有 seq_cst 操作还参与全局顺序。
+
+运行命令：
+
+```bash
+cmake --build build --target atomic_fetch_add_memory_order
+./build/atomic_fetch_add_memory_order
+```
+
+当前 x86_64 + GCC 11.4 环境中的一次运行结果类似：
+
+```text
+fetch_add as a counter
+relaxed      expected 2000000, observed 2000000, ns/fetch_add 10.63
+acquire      expected 2000000, observed 2000000, ns/fetch_add 9.28
+release      expected 2000000, observed 2000000, ns/fetch_add 13.40
+acq_rel      expected 2000000, observed 2000000, ns/fetch_add 15.14
+seq_cst      expected 2000000, observed 2000000, ns/fetch_add 14.44
+
+fetch_add as a publish signal
+relaxed/relaxed          observed 42, wrong
+release/relaxed          observed 42, wrong
+relaxed/acquire          observed 42, wrong
+release/acquire          observed 42, correct
+acq_rel/acquire          observed 42, correct
+seq_cst/seq_cst          observed 42, correct
+```
+
+注意这里的 `wrong` 不是说这次普通运行一定会打印错误值。在 x86 上它们经常也
+打印 `42`。`wrong` 的意思是：C++ 内存模型下没有建立 `payload` 的
+happens-before，普通 `int payload` 的跨线程读写是 data race，程序已经是未
+定义行为。
+
+可以用 ThreadSanitizer 看这个差异：
+
+```bash
+clang++ -std=c++20 -Og -g -fsanitize=thread -fno-omit-frame-pointer \
+  tests/atomic/atomic_fetch_add_memory_order.cpp -pthread \
+  -o /tmp/atomic_fetch_add_memory_order_tsan
+
+/tmp/atomic_fetch_add_memory_order_tsan
+```
+
+预期现象：
+
+- `relaxed/relaxed`、`release/relaxed`、`relaxed/acquire` 这些发布版本会让
+  `payload` 的读写缺少同步，TSan 可以报告 data race。
+- `release/acquire`、`acq_rel/acquire`、`seq_cst/seq_cst` 是正确发布。
+
+### `fetch_add` 的精简汇编
+
+可以用下面命令查看 x86_64 上的核心指令：
+
+```bash
+g++ -std=c++20 -O3 -march=native -S -masm=intel -x c++ \
+  -o /tmp/fetch_add_order_core.s - <<'CPP'
+#include <atomic>
+
+std::atomic<unsigned long long> counter{0};
+
+extern "C" __attribute__((noinline)) void relaxed_add() {
+  counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" __attribute__((noinline)) void acquire_add() {
+  counter.fetch_add(1, std::memory_order_acquire);
+}
+
+extern "C" __attribute__((noinline)) void release_add() {
+  counter.fetch_add(1, std::memory_order_release);
+}
+
+extern "C" __attribute__((noinline)) void acq_rel_add() {
+  counter.fetch_add(1, std::memory_order_acq_rel);
+}
+
+extern "C" __attribute__((noinline)) void seq_cst_add() {
+  counter.fetch_add(1, std::memory_order_seq_cst);
+}
+CPP
+
+sed -n '1,140p' /tmp/fetch_add_order_core.s
+```
+
+当前 x86_64 + GCC 下，这几种通常都会生成同类核心指令：
+
+```asm
+lock add QWORD PTR counter[rip], 1
+ret
+```
+
+原因是 read-modify-write 操作必须原子地完成“读旧值 + 写新值”。在 x86 上，
+跨核心共享 atomic 变量的 RMW 通常需要 `lock` 前缀来保证这个操作不可被其他
+核心打断。
+
+所以在 x86 上，`fetch_add(relaxed)` 和 `fetch_add(seq_cst)` 的核心汇编可能
+看起来一样，性能也可能接近。但它们在 C++ 语义上不同：
+
+- `relaxed`：只保证这个 atomic 变量自身的 RMW 原子性。
+- `release`：额外保证本线程之前的普通写入不会跑到这个发布操作之后。
+- `acquire`：额外保证本线程之后的普通读取不会跑到这个获取操作之前。
+- `acq_rel`：同时具有 acquire 和 release 语义。
+- `seq_cst`：还加入所有 seq_cst 原子操作共享的全局顺序。
+
+结论是：如果只是统计次数，用 `fetch_add(relaxed)` 通常就够；如果这个计数值
+还表示“前面的数据已经可读”，producer 侧至少需要 release，consumer 侧需要
+acquire。

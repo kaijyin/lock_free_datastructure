@@ -11,12 +11,16 @@
  * 若 order 是 relaxed，r1 == 0 && r2 == 0 是允许结果：两个线程都可以先看
  * 到对方变量的旧值。
  *
- * 只用 release store、只用 acquire load，或 release/acquire 成对使用时，
- * r1 == 0 && r2 == 0 仍然允许：因为两个 acquire load 都没有读到对方的
- * release store，所以没有建立 synchronizes-with。
+ * 只用 release store、只用 acquire/seq_cst load，或 release/acquire 成对
+ * 使用时，r1 == 0 && r2 == 0 仍然允许：因为两个 load 都没有读到对方的
+ * release store，或者 store 本身没有进入 seq_cst 全局顺序。
  *
- * 若 order 是 seq_cst，r1 == 0 && r2 == 0 被禁止：所有 seq_cst 操作必须能
- * 排成一个全局一致顺序，而这个结果无法满足该全局顺序。
+ * 只用 seq_cst store、relaxed load 时，C++ 语义上 load 不参与 seq_cst
+ * 全局顺序；但在当前 x86_64 + GCC 下，seq_cst store 会编译成 xchg，所以
+ * 实测不会出现 both-zero。
+ *
+ * 若 store 和 load 都是 seq_cst，r1 == 0 && r2 == 0 被禁止：所有 seq_cst
+ * 操作必须能排成一个全局一致顺序，而这个结果无法满足该全局顺序。
  */
 
 #include <atomic>
@@ -104,23 +108,26 @@ void PrintSummary(const Summary &summary) {
 
 int main() {
   const Summary relaxed =
-      RunStoreBuffering<std::memory_order_relaxed,
-                        std::memory_order_relaxed>("relaxed", kIterations);
+      RunStoreBuffering<std::memory_order_relaxed, std::memory_order_relaxed>(
+          "relaxed", kIterations);
   const Summary release_relaxed =
-      RunStoreBuffering<std::memory_order_release,
-                        std::memory_order_relaxed>("release/relaxed",
-                                                   kIterations);
+      RunStoreBuffering<std::memory_order_release, std::memory_order_relaxed>(
+          "release/relaxed", kIterations);
   const Summary relaxed_acquire =
-      RunStoreBuffering<std::memory_order_relaxed,
-                        std::memory_order_acquire>("relaxed/acquire",
-                                                   kIterations);
+      RunStoreBuffering<std::memory_order_relaxed, std::memory_order_acquire>(
+          "relaxed/acquire", kIterations);
+  const Summary relaxed_seq_cst =
+      RunStoreBuffering<std::memory_order_relaxed, std::memory_order_seq_cst>(
+          "relaxed/seq_cst", kIterations);
+  const Summary seq_cst_relaxed =
+      RunStoreBuffering<std::memory_order_seq_cst, std::memory_order_relaxed>(
+          "seq_cst/relaxed", kIterations);
   const Summary release_acquire =
-      RunStoreBuffering<std::memory_order_release,
-                        std::memory_order_acquire>("release/acquire",
-                                                   kIterations);
+      RunStoreBuffering<std::memory_order_release, std::memory_order_acquire>(
+          "release/acquire", kIterations);
   const Summary seq_cst =
-      RunStoreBuffering<std::memory_order_seq_cst,
-                        std::memory_order_seq_cst>("seq_cst", kIterations);
+      RunStoreBuffering<std::memory_order_seq_cst, std::memory_order_seq_cst>(
+          "seq_cst", kIterations);
 
   std::cout << "Store Buffering: same code, different memory_order\n\n";
   PrintSummary(relaxed);
@@ -128,6 +135,10 @@ int main() {
   PrintSummary(release_relaxed);
   std::cout << "\n";
   PrintSummary(relaxed_acquire);
+  std::cout << "\n";
+  PrintSummary(relaxed_seq_cst);
+  std::cout << "\n";
+  PrintSummary(seq_cst_relaxed);
   std::cout << "\n";
   PrintSummary(release_acquire);
   std::cout << "\n";
@@ -139,6 +150,11 @@ int main() {
         "release store alone can still observe both-zero in this pattern");
   Check(relaxed_acquire.both_zero_count > 0,
         "acquire load alone can still observe both-zero in this pattern");
+  Check(relaxed_seq_cst.both_zero_count > 0,
+        "seq_cst load alone can still observe both-zero in this pattern");
+  Check(seq_cst_relaxed.both_zero_count == 0,
+        "seq_cst store compiles to xchg on this machine and forbids "
+        "both-zero");
   Check(release_acquire.both_zero_count > 0,
         "release/acquire can still observe both-zero in this pattern");
   Check(seq_cst.both_zero_count == 0,
