@@ -150,24 +150,148 @@ PGO 使用:
 - `positive` 的 `Run<lambda #13...#16>` 热主体：5,634 B → 1,661 B，减少
   70.52%。
 
-例如 PGO 版本将 `constant` 的手写 SIMD lambda 独立出来，并把训练中极少执行的
-小数组路径放入冷克隆：
+### PGO 主要做了什么
+
+一句话概括：PGO 没有更换算法，而是利用训练阶段记录的执行次数，重新决定大段
+代码是否内联、基本块如何排列、低频分支放在哪里，以及循环主路径应该重点优化
+哪一种输入形状。
+
+`-O3 -march=native` 主要负责生成 SIMD 指令，LTO 让编译器看见跨文件代码；PGO
+在此基础上补充“哪些代码实际最常执行”的信息。这三类优化相互配合，但职责不同。
+
+#### 1. 合并预热和计时阶段重复展开的大循环
+
+`Measure()` 在两个位置调用同一个 `operation`：
+
+```cpp
+for (std::size_t i = 0; i < 20; ++i) operation();
+
+for (std::size_t sample = 0; sample < samples; ++sample) {
+  const auto start = Clock::now();
+  for (std::size_t i = 0; i < iterations; ++i) operation();
+  // 记录耗时。
+}
+```
+
+非 PGO 版本把部分 lambda 的数组循环分别内联到预热和计时位置，相同的机器码会
+在 `Run` 实例中出现两份。PGO 版本根据实际调用频率和函数大小调整内联决策：把
+较大的 lambda 提取成一个独立函数，两个位置通过 `call` 复用同一份循环。
+
+例如 `constant` 的手写 SIMD lambda #4 在 PGO 版本中被两个循环共同调用：
+
+```asm
+# 20 次预热
+38f68:
+    mov    %r15,%rdi
+    call   39970 <main::{lambda()#4}::operator()() const>
+    dec    %r12
+    jne    38f68
+
+# 正式计时
+395e3:
+    mov    %r15,%rdi
+    inc    %r14
+    call   39970 <main::{lambda()#4}::operator()() const>
+    cmp    %r14,%rbp
+    jne    395e3
+```
+
+一次 lambda 调用内部会处理 16,384 个元素，因此额外一次函数调用的固定成本很小；
+只保留一份大循环则可以减轻指令缓存压力。
+
+`positive` 的变化更加明显。PGO 将禁止向量化的 lambda #13、编译器自动向量化的
+lambda #14 和手写 SIMD 的 lambda #16 都提取成了独立函数；xtensor 的 lambda #15
+包装层仍被内联，`Run` 直接调用 `XUnary`。非 PGO 版本中没有这些独立 lambda 符号，
+相应循环都位于 `Run` 内部。因为 #14 和 #16 比 `constant` 的填充循环更大，
+`positive` 热 `Run` 的缩小比例也更高。
+
+#### 2. 把低频边界处理移到冷区
+
+训练的主要输入长度为 16,384，GCC 因而知道大数组 SIMD 主循环是高频路径，而
+`size <= 3`、标量尾部等分支很少执行。PGO 没有删除这些正确性处理，而是把它们
+拆分到 `.cold` 克隆：
 
 ```asm
 cmp    $0x3,%rdi
-jbe    <main::{lambda()#4}::operator()() const [clone .cold]>
-vbroadcastsd <constant>,%ymm0
-...
-prefetchw (%rdx)
-vmovupd %ymm0,...
+jbe    <main::{lambda()#16}::operator()() const [clone .cold]>
+
+# 紧接高频 AVX 主循环。
+vmovupd      (...),%ymm0
+vcmpge_oqpd  %ymm4,%ymm0,%ymm2
+vcmpordpd    %ymm0,%ymm0,%ymm1
+vandpd       %ymm2,%ymm1,%ymm1
+vblendvpd    %ymm1,%ymm0,%ymm3,%ymm0
 ```
 
-基线版本也生成了 AVX 写循环，但它被嵌在约 4.3 KB 的 `Run` 实例内部，低频分支
-仍跳到同一个大型函数的后部。PGO 版本把热循环、冷尾部和计时/输出路径重新布局，
-改善指令缓存局部性，并减少热路径附近的跳转。
+标量尾部位于较远的冷代码区域：
 
-PGO 并没有改变算法，也没有简单地把所有函数内联。它根据训练频率重新决定哪些
-函数内联、克隆、常量传播或移到冷路径；这也是部分算子加速、部分算子回退的原因。
+```asm
+<main::{lambda()#16}::operator()() const [clone .cold]>:
+    vmovsd   (...),%xmm0
+    vucomisd %xmm0,%xmm0
+    ...
+```
+
+这样热循环附近包含更少的低频跳转和边界代码，CPU 顺序取指和分支预测更容易命中。
+整个二进制的 `.cold` 克隆从 116 个增加到 271 个，也验证了这种热冷拆分。
+
+#### 3. 根据真实循环次数优化主循环形态
+
+`constant` 的非 PGO 写循环使用较碎的 128-bit 写入和多条 lane 提取：
+
+```asm
+prefetchw     (%rax)
+add           $0x40,%rax
+vmovupd       %xmm3,-0x480(%rax)
+vextractf128  $0x1,%ymm3,-0x470(%rax)
+vextractf128  $0x1,%ymm3,-0x460(%rax)
+vextractf128  $0x1,%ymm3,-0x450(%rax)
+```
+
+PGO 版本针对训练中反复出现的大数组路径，生成了更紧凑的 64 字节循环主体：
+
+```asm
+vbroadcastsd <constant>,%ymm0
+
+<loop>:
+    vmovupd   %ymm0,-0x440(%rdx)
+    prefetchw (%rdx)
+    add       $0x40,%rdx
+    vmovupd   %ymm0,-0x460(%rdx)
+    cmp       %r8,%rsi
+    jb        <loop>
+```
+
+两次 256-bit store 完成一次 64 字节批量写入，主循环指令更少。这一变化与函数去重、
+热冷布局共同作用，是 `constant` SIMD 明显加速的重要原因；不能只用函数尺寸变化
+解释其性能收益。
+
+#### 4. 创建更小的专用版本并重新排列基本块
+
+PGO 与 LTO 一起生成了更多 `.constprop` 和 `.isra` 克隆。它们分别表示常量传播后的
+专用函数，以及经过跨过程标量替换或参数简化的函数。符号数量因此增加，但通用大
+函数和低频分支被拆小，最终 `.text` 反而减少 26.28%。
+
+从整个二进制看，PGO 后：
+
+- 跳转指令减少 36.01%，说明基本块布局和冷路径拆分变化明显；
+- `call` 只减少 7.97%，说明 PGO 并不是简单地“尽量内联”；
+- `.constprop`、`.isra` 和 `.cold` 克隆均明显增加，说明 GCC 更积极地生成适合实际
+  workload 的专用版本。
+
+#### 如何理解热 `Run` 缩小比例
+
+44.19% 和 70.52% 只统计热 `Run` 符号本身，不包含被提取出的 lambda 和 `.cold`
+代码。将局部相关代码重新加回来后，对比更接近如下口径：
+
+| 实例 | 非 PGO `Run` + cold | PGO `Run` + lambda + cold | 局部缩小 |
+|---|---:|---:|---:|
+| `constant` | 4,509 B | 3,155 B | 30.03% |
+| `positive` | 5,782 B | 3,386 B | 41.44% |
+
+所以，热 `Run` 缩小不代表运行时少做了相同比例的计算。部分机器码只是从 `Run`
+搬到可以复用的独立函数或冷区；真正删除的主要是重复展开、通用分支和可以由 profile
+证明不必放在热路径附近的代码。
 
 ## 复现流程
 
